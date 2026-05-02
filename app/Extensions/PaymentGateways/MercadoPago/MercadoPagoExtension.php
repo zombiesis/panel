@@ -7,6 +7,7 @@ use App\Enums\PaymentStatus;
 use App\Models\Payment;
 use App\Models\ShopProduct;
 use App\Models\User;
+use App\Services\PaymentRecheckResult;
 use App\Traits\HandlesGatewayPayments;
 use Exception;
 use Illuminate\Http\JsonResponse;
@@ -228,6 +229,157 @@ class MercadoPagoExtension extends PaymentExtension
         }
 
         return response()->json(['success' => true], 200);
+    }
+
+    public static function recheckPayment(Payment $payment): PaymentRecheckResult
+    {
+        try {
+            $mercado = self::fetchMercadoPagoPaymentForRecheck($payment);
+        } catch (Exception $e) {
+            Log::error('MercadoPago manual recheck provider request failed.', [
+                'payment_id' => $payment->id,
+                'mercadopago_payment_id' => $payment->payment_id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return PaymentRecheckResult::providerFailure('MercadoPago could not be reached while rechecking this payment.');
+        }
+
+        if ($mercado === null) {
+            Log::warning('MercadoPago manual recheck skipped because no gateway payment could be found.', [
+                'payment_id' => $payment->id,
+                'mercadopago_payment_id' => $payment->payment_id,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('MercadoPago payment could not be found.');
+        }
+
+        $ctrlPanelPaymentId = data_get($mercado, 'metadata.ctrl_panel_payment_id')
+            ?? data_get($mercado, 'metadata.crtl_panel_payment_id')
+            ?? data_get($mercado, 'external_reference');
+
+        if ((string) $ctrlPanelPaymentId !== $payment->id) {
+            Log::warning('MercadoPago manual recheck payment id mismatch.', [
+                'payment_id' => $payment->id,
+                'resolved_payment_id' => $ctrlPanelPaymentId,
+                'mercadopago_payment_id' => $mercado['id'] ?? null,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('MercadoPago payment does not belong to this payment.');
+        }
+
+        $externalRef = (string) data_get($mercado, 'external_reference', '');
+        if ($externalRef !== $payment->id) {
+            Log::warning('MercadoPago manual recheck external_reference mismatch.', [
+                'payment_id' => $payment->id,
+                'mercadopago_payment_id' => $mercado['id'] ?? null,
+                'external_reference' => $externalRef,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('MercadoPago external reference does not match this payment.');
+        }
+
+        $status = data_get($mercado, 'status');
+        $gatewayPaymentId = data_get($mercado, 'id') !== null ? (string) data_get($mercado, 'id') : null;
+
+        if (!self::matchesMercadoPagoAmountAndCurrency($payment, $mercado)) {
+            Log::warning('MercadoPago manual recheck amount/currency mismatch.', [
+                'payment_id' => $payment->id,
+                'mercadopago_payment_id' => $gatewayPaymentId,
+                'transaction_amount' => data_get($mercado, 'transaction_amount'),
+                'currency_id' => data_get($mercado, 'currency_id'),
+            ]);
+
+            return PaymentRecheckResult::canceled($gatewayPaymentId, [
+                'reason' => 'amount_or_currency_mismatch',
+            ]);
+        }
+
+        if ($status === 'approved') {
+            return PaymentRecheckResult::paid($gatewayPaymentId);
+        } elseif (in_array($status, ['cancelled', 'canceled', 'rejected', 'refunded', 'charged_back'], true)) {
+            return PaymentRecheckResult::canceled($gatewayPaymentId);
+        } elseif (in_array($status, ['pending', 'in_process', 'authorized'], true)) {
+            return PaymentRecheckResult::processing($gatewayPaymentId);
+        }
+
+        return PaymentRecheckResult::unverifiable('MercadoPago returned an unsupported payment status.', [
+            'gateway_status' => $status,
+        ]);
+    }
+
+    protected static function fetchMercadoPagoPaymentForRecheck(Payment $payment): ?array
+    {
+        $settings = new MercadoPagoSettings();
+        $headers = [
+            'Content-Type' => 'application/json',
+            'Authorization' => 'Bearer ' . $settings->access_token,
+        ];
+
+        if (!empty($payment->payment_id)) {
+            $response = Http::withHeaders($headers)
+                ->get('https://api.mercadopago.com/v1/payments/' . $payment->payment_id);
+
+            if ($response->successful()) {
+                $payload = $response->json();
+
+                return is_array($payload) ? $payload : null;
+            }
+
+            Log::warning('MercadoPago manual recheck direct fetch failed; trying external_reference search.', [
+                'payment_id' => $payment->id,
+                'mercadopago_payment_id' => $payment->payment_id,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+        }
+
+        $response = Http::withHeaders($headers)
+            ->get('https://api.mercadopago.com/v1/payments/search', [
+                'external_reference' => $payment->id,
+                'sort' => 'date_created',
+                'criteria' => 'desc',
+            ]);
+
+        if (!$response->successful()) {
+            Log::error('MercadoPago manual recheck search failed.', [
+                'payment_id' => $payment->id,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            throw new Exception('Unable to retrieve MercadoPago payment details.');
+        }
+
+        $results = $response->json('results', []);
+        if (!is_array($results)) {
+            return null;
+        }
+
+        foreach ($results as $result) {
+            if (is_array($result) && (string) ($result['external_reference'] ?? '') === $payment->id) {
+                return $result;
+            }
+        }
+
+        return null;
+    }
+
+    protected static function matchesMercadoPagoAmountAndCurrency(Payment $payment, array $mercado): bool
+    {
+        $amount = data_get($mercado, 'transaction_amount');
+        $currency = data_get($mercado, 'currency_id');
+
+        if (!is_numeric($amount) || !is_string($currency) || $currency === '') {
+            return false;
+        }
+
+        $expectedAmount = (float) self::currencyHelper()->formatForForm($payment->total_price, 2);
+        if (abs((float) $amount - $expectedAmount) > 0.0001) {
+            return false;
+        }
+
+        return strtoupper($currency) === strtoupper($payment->currency_code);
     }
 
     /**

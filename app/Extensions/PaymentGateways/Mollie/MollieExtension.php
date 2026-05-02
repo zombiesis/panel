@@ -6,6 +6,7 @@ use App\Classes\PaymentExtension;
 use App\Enums\PaymentStatus;
 use App\Models\Payment;
 use App\Models\ShopProduct;
+use App\Services\PaymentRecheckResult;
 use App\Traits\HandlesGatewayPayments;
 use Exception;
 use Illuminate\Http\JsonResponse;
@@ -60,6 +61,12 @@ class MollieExtension extends PaymentExtension
             if ($response->status() != 201) {
                 Log::error('Mollie Payment: ' . $response->body());
                 throw new Exception('Payment failed');
+            }
+
+            $molliePaymentId = (string) $response->json('id', '');
+            if ($molliePaymentId !== '') {
+                $payment->payment_id = $molliePaymentId;
+                $payment->save();
             }
 
             return $response->json()['_links']['checkout']['href'];
@@ -153,6 +160,75 @@ class MollieExtension extends PaymentExtension
         }
 
         return response()->json(['success' => true], 200);
+    }
+
+    public static function recheckPayment(Payment $payment): PaymentRecheckResult
+    {
+        if (empty($payment->payment_id)) {
+            Log::warning('Mollie manual recheck skipped because payment has no Mollie payment id.', [
+                'payment_id' => $payment->id,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('Mollie payment id is missing.');
+        }
+
+        $settings = new MollieSettings();
+        $response = Http::withHeaders([
+            'Content-Type' => 'application/json',
+            'Authorization' => 'Bearer ' . $settings->api_key,
+        ])->get('https://api.mollie.com/v2/payments/' . $payment->payment_id);
+
+        if (!$response->successful()) {
+            Log::error('Mollie manual recheck fetch failed.', [
+                'payment_id' => $payment->id,
+                'mollie_payment_id' => $payment->payment_id,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return PaymentRecheckResult::providerFailure('Mollie could not be reached while rechecking this payment.', [
+                'provider_status' => $response->status(),
+            ]);
+        }
+
+        $metadataPaymentId = (string) $response->json('metadata.payment_id', '');
+        if ($metadataPaymentId !== $payment->id) {
+            Log::warning('Mollie manual recheck metadata mismatch.', [
+                'payment_id' => $payment->id,
+                'metadata_payment_id' => $metadataPaymentId,
+                'mollie_payment_id' => $response->json('id'),
+            ]);
+
+            return PaymentRecheckResult::unverifiable('Mollie payment does not belong to this payment.');
+        }
+
+        if (!self::matchesMollieAmountAndCurrency(
+            $payment,
+            (string) $response->json('amount.value', ''),
+            (string) $response->json('amount.currency', '')
+        )) {
+            Log::warning('Mollie manual recheck amount/currency mismatch.', [
+                'payment_id' => $payment->id,
+                'mollie_payment_id' => $response->json('id'),
+            ]);
+
+            return PaymentRecheckResult::canceled((string) $response->json('id'), [
+                'reason' => 'amount_or_currency_mismatch',
+            ]);
+        }
+
+        $status = (string) $response->json('status', '');
+        if ($status === 'paid') {
+            return PaymentRecheckResult::paid((string) $response->json('id'));
+        } elseif (in_array($status, ['failed', 'expired', 'canceled'], true)) {
+            return PaymentRecheckResult::canceled((string) $response->json('id'));
+        } elseif (in_array($status, ['authorized', 'pending', 'open'], true)) {
+            return PaymentRecheckResult::processing((string) $response->json('id'));
+        }
+
+        return PaymentRecheckResult::unverifiable('Mollie returned an unsupported payment status.', [
+            'gateway_status' => $status,
+        ]);
     }
 
     protected static function matchesMollieAmountAndCurrency(Payment $payment, string $amount, string $currency): bool

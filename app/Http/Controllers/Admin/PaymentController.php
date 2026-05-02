@@ -26,6 +26,8 @@ use App\Helpers\ExtensionHelper;
 use App\Settings\CouponSettings;
 use App\Settings\GeneralSettings;
 use App\Settings\LocaleSettings;
+use App\Services\PaymentAdministrationService;
+use App\Services\PaymentManualActionResult;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 
@@ -33,6 +35,7 @@ class PaymentController extends Controller
 {
     const BUY_PERMISSION = 'user.shop.buy';
     const VIEW_PERMISSION = "admin.payments.read";
+    const MANAGE_PERMISSION = "admin.payments.write";
 
     use CouponTrait;
 
@@ -230,16 +233,31 @@ class PaymentController extends Controller
         return redirect()->route('store.index')->with('info', 'Payment was Canceled');
     }
 
+    public function forceConfirm(Payment $payment, PaymentAdministrationService $payments): RedirectResponse
+    {
+        $this->checkPermission(self::MANAGE_PERMISSION);
+
+        return $this->redirectBackWithPaymentResult($payments->forceConfirm($payment, Auth::user()));
+    }
+
+    public function recheck(Payment $payment, PaymentAdministrationService $payments): RedirectResponse
+    {
+        $this->checkPermission(self::MANAGE_PERMISSION);
+
+        return $this->redirectBackWithPaymentResult($payments->recheck($payment, Auth::user()));
+    }
+
     /**
      * @return JsonResponse|mixed
      *
      * @throws Exception
      */
-    public function dataTable()
+    public function dataTable(PaymentAdministrationService $payments)
     {
         $this->checkPermission(self::VIEW_PERMISSION);
 
         $query = Payment::with('user');
+        $canManagePayments = $this->can(self::MANAGE_PERMISSION);
 
         return datatables($query)
 
@@ -267,16 +285,34 @@ class PaymentController extends Controller
                     'raw' => $payment->created_at ? strtotime($payment->created_at) : ''
                 ];
             })
-            ->addColumn('actions', function (Payment $payment) {
+            ->addColumn('actions', function (Payment $payment) use ($canManagePayments, $payments) {
                 $invoice = Invoice::where('payment_id', '=', $payment->payment_id)->first();
+                $actions = '';
+
+                if ($canManagePayments && $payments->canManuallyManage($payment)) {
+                    $actions .= '<form class="d-inline" onsubmit="return confirmForcePayment();" method="post" action="' . route('admin.payments.forceConfirm', $payment->id) . '">
+                        ' . csrf_field() . '
+                        <button data-content="' . e(__('Force confirm')) . '" data-toggle="popover" data-trigger="hover" data-placement="top" class="mr-1 text-white btn btn-sm btn-success" aria-label="' . e(__('Force confirm')) . '"><i class="fas fa-check"></i></button>
+                    </form>';
+
+                    $actions .= '<form class="d-inline" method="post" action="' . route('admin.payments.recheck', $payment->id) . '">
+                        ' . csrf_field() . '
+                        <button data-content="' . e(__('Recheck')) . '" data-toggle="popover" data-trigger="hover" data-placement="top" class="mr-1 text-white btn btn-sm btn-warning" aria-label="' . e(__('Recheck')) . '"><i class="fas fa-sync-alt"></i></button>
+                    </form>';
+                }
 
                 if ($invoice && File::exists(storage_path('app/invoice/' . $invoice->invoice_user . '/' . $invoice->created_at->format('Y') . '/' . $invoice->invoice_name . '.pdf'))) {
-                    return '<a data-content="' . __('Download') . '" data-toggle="popover" data-trigger="hover" data-placement="top" href="' . route('admin.invoices.downloadSingleInvoice', ['id' => $payment->payment_id]) . '" class="mr-1 text-white btn btn-sm btn-info"><i class="fas fa-file-download"></i></a>';
-                } else {
-                    return '';
+                    $actions .= '<a data-content="' . e(__('Download')) . '" data-toggle="popover" data-trigger="hover" data-placement="top" href="' . route('admin.invoices.downloadSingleInvoice', ['id' => $payment->payment_id]) . '" class="mr-1 text-white btn btn-sm btn-info"><i class="fas fa-file-download"></i></a>';
                 }
+
+                return $actions;
             })
             ->rawColumns(['actions', 'user'])
             ->make(true);
+    }
+
+    private function redirectBackWithPaymentResult(PaymentManualActionResult $result): RedirectResponse
+    {
+        return back()->with($result->flashLevel, __($result->message, $result->context));
     }
 }

@@ -6,6 +6,7 @@ use App\Classes\PaymentExtension;
 use App\Enums\PaymentStatus;
 use App\Models\Payment;
 use App\Models\ShopProduct;
+use App\Services\PaymentRecheckResult;
 use App\Traits\HandlesGatewayPayments;
 use Exception;
 use Illuminate\Http\JsonResponse;
@@ -22,6 +23,7 @@ use PayPalCheckoutSdk\Orders\OrdersCaptureRequest;
 use PayPalCheckoutSdk\Orders\OrdersCreateRequest;
 use PayPalCheckoutSdk\Orders\OrdersGetRequest;
 use PayPalHttp\HttpException;
+use Throwable;
 
 
 /**
@@ -95,6 +97,14 @@ class PayPalExtension extends PaymentExtension
             if ($response->statusCode != 201) {
                 throw new \Exception($response->statusCode);
             }
+
+            $orderId = (string) ($response->result->id ?? '');
+            if ($orderId === '') {
+                throw new \Exception('No PayPal order ID found');
+            }
+
+            $payment->payment_id = $orderId;
+            $payment->save();
 
             $approvalLink = null;
             foreach (($response->result->links ?? []) as $link) {
@@ -359,6 +369,116 @@ class PayPalExtension extends PaymentExtension
         self::setPaymentCanceled($payment->id, $gatewayReference !== '' ? $gatewayReference : null);
     }
 
+    public static function recheckPayment(Payment $payment): PaymentRecheckResult
+    {
+        if (empty($payment->payment_id)) {
+            Log::warning('PayPal manual recheck skipped because payment has no PayPal order id.', [
+                'payment_id' => $payment->id,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('PayPal order id is missing.');
+        }
+
+        try {
+            $order = self::getPayPalOrder($payment->payment_id);
+        } catch (Throwable $e) {
+            Log::error('PayPal manual recheck provider request failed.', [
+                'payment_id' => $payment->id,
+                'paypal_order_id' => $payment->payment_id,
+                'error' => $e->getMessage(),
+                'exception' => get_class($e),
+            ]);
+
+            return PaymentRecheckResult::providerFailure('PayPal could not be reached while rechecking this payment.');
+        }
+
+        $resolvedPaymentId = self::extractPaymentIdFromOrder($order);
+        if (empty($resolvedPaymentId) || $resolvedPaymentId !== $payment->id) {
+            Log::warning('PayPal manual recheck payment id mismatch.', [
+                'payment_id' => $payment->id,
+                'resolved_payment_id' => $resolvedPaymentId,
+                'paypal_order_id' => $payment->payment_id,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('PayPal order does not belong to this payment.');
+        }
+
+        if (!self::isValidPayPalOrderAmount($payment, $order)) {
+            Log::warning('PayPal manual recheck order amount/currency mismatch.', [
+                'payment_id' => $payment->id,
+                'paypal_order_id' => $payment->payment_id,
+            ]);
+
+            return PaymentRecheckResult::canceled($payment->payment_id, [
+                'reason' => 'amount_or_currency_mismatch',
+            ]);
+        }
+
+        $orderData = json_decode(json_encode($order), true);
+        $captures = data_get($orderData, 'purchase_units.0.payments.captures', []);
+
+        if (is_array($captures)) {
+            foreach ($captures as $capture) {
+                $captureStatus = strtoupper((string) data_get($capture, 'status', ''));
+
+                if ($captureStatus === 'COMPLETED') {
+                    if (!self::isValidPayPalCaptureAmount($payment, is_array($capture) ? $capture : [])) {
+                        Log::warning('PayPal manual recheck capture amount/currency mismatch.', [
+                            'payment_id' => $payment->id,
+                            'paypal_order_id' => $payment->payment_id,
+                            'capture_id' => data_get($capture, 'id'),
+                        ]);
+
+                        return PaymentRecheckResult::canceled($payment->payment_id, [
+                            'reason' => 'amount_or_currency_mismatch',
+                        ]);
+                    }
+
+                    return PaymentRecheckResult::paid($payment->payment_id);
+                }
+
+                if ($captureStatus === 'PENDING') {
+                    return PaymentRecheckResult::processing($payment->payment_id);
+                }
+
+                if (in_array($captureStatus, ['DENIED', 'DECLINED', 'REFUNDED', 'REVERSED'], true)) {
+                    return PaymentRecheckResult::canceled($payment->payment_id);
+                }
+            }
+        }
+
+        $orderStatus = strtoupper((string) ($order->status ?? ''));
+
+        if ($orderStatus === 'COMPLETED') {
+            return PaymentRecheckResult::paid($payment->payment_id);
+        } elseif ($orderStatus === 'APPROVED') {
+            try {
+                $capturedOrder = self::capturePayPalOrder($payment->payment_id);
+            } catch (Throwable $e) {
+                Log::error('PayPal manual recheck capture failed.', [
+                    'payment_id' => $payment->id,
+                    'paypal_order_id' => $payment->payment_id,
+                    'error' => $e->getMessage(),
+                    'exception' => get_class($e),
+                ]);
+
+                return PaymentRecheckResult::providerFailure('PayPal could not capture the approved order during recheck.');
+            }
+
+            if ($capturedOrder !== null && strtoupper((string) ($capturedOrder->status ?? '')) === 'COMPLETED') {
+                return PaymentRecheckResult::paid($payment->payment_id);
+            }
+
+            return PaymentRecheckResult::processing($payment->payment_id);
+        } elseif (in_array($orderStatus, ['VOIDED', 'CANCELLED', 'CANCELED'], true)) {
+            return PaymentRecheckResult::canceled($payment->payment_id);
+        }
+
+        return PaymentRecheckResult::unverifiable('PayPal returned an unsupported order status.', [
+            'gateway_status' => $orderStatus,
+        ]);
+    }
+
     protected static function verifyWebhookSignature(Request $request, array $event): bool
     {
         try {
@@ -480,17 +600,17 @@ class PayPalExtension extends PaymentExtension
         return strtoupper($currency) === strtoupper($payment->currency_code);
     }
 
-    protected static function capturePayPalOrder(string $orderId): void
+    protected static function capturePayPalOrder(string $orderId): ?object
     {
         $request = new OrdersCaptureRequest($orderId);
         $request->prefer('return=representation');
 
         try {
-            self::getPayPalClient()->execute($request);
+            return self::getPayPalClient()->execute($request)->result;
         } catch (HttpException $exception) {
             // Approved orders can be captured by another retry/webhook delivery.
             if (in_array((int) $exception->statusCode, [409, 422], true)) {
-                return;
+                return null;
             }
 
             throw $exception;

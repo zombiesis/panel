@@ -162,6 +162,8 @@ Route::middleware(['auth', 'checkSuspended'])->group(function () {
 
         //payments
         Route::get('payments/datatable', [PaymentController::class, 'datatable'])->name('payments.datatable');
+        Route::post('payments/{payment}/force-confirm', [PaymentController::class, 'forceConfirm'])->name('payments.forceConfirm');
+        Route::post('payments/{payment}/recheck', [PaymentController::class, 'recheck'])->name('payments.recheck');
         Route::get('payments', [PaymentController::class, 'index'])->name('payments.index');
 
         //settings

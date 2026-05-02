@@ -6,6 +6,7 @@ use App\Facades\Currency;
 use App\Settings\GeneralSettings;
 use Hidehalo\Nanoid\Client;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use NumberFormatter;
 use Spatie\Activitylog\LogOptions;
@@ -14,6 +15,7 @@ use Spatie\Activitylog\Traits\LogsActivity;
 
 class ShopProduct extends Model
 {
+    use HasFactory;
     use LogsActivity, CausesActivity;
 
     public function getActivitylogOptions(): LogOptions

@@ -88,13 +88,17 @@
                     {data: 'payment_method'},
                     {data: 'status'},
                     {data: 'created_at', type: 'num', render: {_: 'display', sort: 'raw'}},
-                    {data: 'actions' , sortable : false},
+                    {data: 'actions', orderable: false, sortable: false, searchable: false},
                 ],
                 fnDrawCallback: function(oSettings) {
                     $('[data-toggle="popover"]').popover();
                 },
             });
         });
+
+        function confirmForcePayment() {
+            return confirm(@json(__('Are you sure you want to force confirm this payment?')));
+        }
     </script>
 
 @endsection

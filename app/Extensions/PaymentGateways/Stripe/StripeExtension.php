@@ -6,6 +6,7 @@ use App\Classes\PaymentExtension;
 use App\Enums\PaymentStatus;
 use App\Models\Payment;
 use App\Models\ShopProduct;
+use App\Services\PaymentRecheckResult;
 use App\Traits\HandlesGatewayPayments;
 use Exception;
 use Illuminate\Http\JsonResponse;
@@ -97,6 +98,12 @@ class StripeExtension extends PaymentExtension
                 ],
             ],
         ]);
+
+        $paymentIntentId = isset($request->payment_intent) ? (string) $request->payment_intent : '';
+        if ($paymentIntentId !== '') {
+            $payment->payment_id = $paymentIntentId;
+            $payment->save();
+        }
 
         return $request->url;
     }
@@ -335,6 +342,127 @@ class StripeExtension extends PaymentExtension
         }
 
         return response()->json(['success' => true], 200);
+    }
+
+    public static function recheckPayment(Payment $payment): PaymentRecheckResult
+    {
+        try {
+            $paymentIntent = self::findStripePaymentIntentForRecheck($payment);
+        } catch (Throwable $e) {
+            Log::error('Stripe manual recheck provider request failed.', [
+                'payment_id' => $payment->id,
+                'stripe_payment_intent_id' => $payment->payment_id,
+                'error' => $e->getMessage(),
+                'exception' => get_class($e),
+            ]);
+
+            return PaymentRecheckResult::providerFailure('Stripe could not be reached while rechecking this payment.');
+        }
+
+        if ($paymentIntent === null) {
+            Log::warning('Stripe manual recheck skipped because no payment intent could be found.', [
+                'payment_id' => $payment->id,
+                'stripe_payment_intent_id' => $payment->payment_id,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('Stripe payment intent could not be found.');
+        }
+
+        $metadataPaymentId = (string) ($paymentIntent->metadata->payment_id ?? '');
+        if ($metadataPaymentId !== $payment->id) {
+            Log::warning('Stripe manual recheck metadata mismatch.', [
+                'payment_id' => $payment->id,
+                'metadata_payment_id' => $metadataPaymentId,
+                'stripe_payment_intent_id' => $paymentIntent->id ?? null,
+            ]);
+
+            return PaymentRecheckResult::unverifiable('Stripe payment intent does not belong to this payment.');
+        }
+
+        if (!empty($paymentIntent->id) && $payment->payment_id !== (string) $paymentIntent->id) {
+            $payment->payment_id = (string) $paymentIntent->id;
+            $payment->save();
+        }
+
+        $status = (string) ($paymentIntent->status ?? '');
+        if ($status === 'succeeded') {
+            if (!self::isValidStripePaymentPayload($payment, $paymentIntent)) {
+                Log::warning('Stripe manual recheck payload validation failed; canceling payment', [
+                    'payment_id' => $payment->id,
+                    'payment_intent_id' => $paymentIntent->id ?? null,
+                    'payment_currency' => $payment->currency_code,
+                    'gateway_currency' => $paymentIntent->currency ?? null,
+                    'amount_received' => $paymentIntent->amount_received ?? null,
+                    'expected_total' => $payment->total_price,
+                ]);
+
+                return PaymentRecheckResult::canceled($paymentIntent->id ?? null, [
+                    'reason' => 'amount_or_currency_mismatch',
+                ]);
+            }
+
+            return PaymentRecheckResult::paid($paymentIntent->id ?? null);
+        } elseif ($status === 'canceled') {
+            return PaymentRecheckResult::canceled($paymentIntent->id ?? null);
+        } elseif (in_array($status, ['processing', 'requires_action', 'requires_confirmation', 'requires_capture'], true)) {
+            if (!self::isValidStripePaymentIntentAmount($payment, $paymentIntent)) {
+                Log::warning('Stripe manual recheck intent amount/currency validation failed; canceling payment', [
+                    'payment_id' => $payment->id,
+                    'payment_intent_id' => $paymentIntent->id ?? null,
+                    'payment_currency' => $payment->currency_code,
+                    'gateway_currency' => $paymentIntent->currency ?? null,
+                    'gateway_amount' => $paymentIntent->amount ?? null,
+                    'expected_total' => $payment->total_price,
+                ]);
+
+                return PaymentRecheckResult::canceled($paymentIntent->id ?? null, [
+                    'reason' => 'amount_or_currency_mismatch',
+                ]);
+            }
+
+            return PaymentRecheckResult::processing($paymentIntent->id ?? null);
+        }
+
+        return PaymentRecheckResult::unverifiable('Stripe returned an unsupported payment status.', [
+            'gateway_status' => $status,
+        ]);
+    }
+
+    protected static function findStripePaymentIntentForRecheck(Payment $payment): ?object
+    {
+        $stripeClient = self::getStripeClient();
+
+        if (!empty($payment->payment_id)) {
+            return $stripeClient->paymentIntents->retrieve($payment->payment_id);
+        }
+
+        if (!method_exists($stripeClient->paymentIntents, 'search')) {
+            return null;
+        }
+
+        $searchResults = $stripeClient->paymentIntents->search([
+            'query' => "metadata['payment_id']:'" . self::escapeStripeSearchValue($payment->id) . "'",
+            'limit' => 1,
+        ]);
+
+        return $searchResults->data[0] ?? null;
+    }
+
+    protected static function escapeStripeSearchValue(string $value): string
+    {
+        return str_replace(["\\", "'"], ["\\\\", "\\'"], $value);
+    }
+
+    protected static function isValidStripePaymentIntentAmount(Payment $payment, object $paymentIntent): bool
+    {
+        $currency = strtoupper((string) ($paymentIntent->currency ?? ''));
+        $expectedCurrency = strtoupper($payment->currency_code);
+        $amountInSmallestUnit = (int) ($paymentIntent->amount ?? 0);
+        $amountInDatabaseUnits = self::convertGatewayAmountToDatabaseUnits($amountInSmallestUnit, $currency);
+
+        return $currency !== ''
+            && $currency === $expectedCurrency
+            && $amountInDatabaseUnits === (int) $payment->total_price;
     }
 
     /**
